@@ -1,0 +1,285 @@
+"""
+TSB Raid Request Bot (discord.py 2.x)
+
+Flow:
+  /setup_panel  -> posts the "Request Raid" embed with a Raid / Backup dropdown
+  pick an option -> form (teamers, clan, server link, Roblox username)
+  submit         -> new ticket channel in your category with
+                    [Join Raid] [Close Ticket] [Open Profile] buttons
+"""
+import asyncio
+import os
+
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ======================= CONFIG (edit these) =======================
+TOKEN = os.getenv("DISCORD_TOKEN")   # goes in your .env file, NOT here
+GUILD_ID = 0             # your server ID (makes slash commands show up instantly)
+TICKET_CATEGORY_ID = 0   # ID of the category where ticket channels get created
+VIEWER_ROLE_ID = 0       # role that can SEE tickets (0 = everyone can see them)
+PING_ROLE_ID = 0         # role to ping on each new request (0 = no ping)
+EMBED_COLOR = 0xB30000   # TSB-style dark red
+# ====================================================================
+
+
+def get_requester_id(channel: discord.abc.GuildChannel):
+    """Ticket topic looks like 'requester:123|type:Raid'."""
+    for part in (getattr(channel, "topic", None) or "").split("|"):
+        if part.startswith("requester:"):
+            try:
+                return int(part.split(":")[1])
+            except ValueError:
+                return None
+    return None
+
+
+async def get_roblox_profile(session: aiohttp.ClientSession, username: str):
+    """Returns (user_id, canonical_name) or None if not found."""
+    try:
+        async with session.post(
+            "https://users.roblox.com/v1/usernames/users",
+            json={"usernames": [username], "excludeBannedUsers": True},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            if data.get("data"):
+                user = data["data"][0]
+                return user["id"], user["name"]
+    except Exception:
+        pass
+    return None
+
+
+# ------------------------- Ticket buttons -------------------------
+class TicketView(discord.ui.View):
+    def __init__(self, profile_url: str | None = None):
+        super().__init__(timeout=None)
+        if profile_url:
+            self.add_item(
+                discord.ui.Button(
+                    label="Open Profile",
+                    emoji="👤",
+                    style=discord.ButtonStyle.link,
+                    url=profile_url,
+                )
+            )
+
+    @discord.ui.button(label="Join Raid", emoji="⚔️", style=discord.ButtonStyle.success, custom_id="tsb:join")
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        if interaction.user.id == get_requester_id(channel):
+            return await interaction.response.send_message("This is your own request.", ephemeral=True)
+        if channel.overwrites_for(interaction.user).send_messages:
+            return await interaction.response.send_message("You already joined this raid.", ephemeral=True)
+
+        await channel.set_permissions(
+            interaction.user,
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+        )
+        await interaction.response.send_message(f"⚔️ {interaction.user.mention} joined the raid!")
+
+    @discord.ui.button(label="Close Ticket", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="tsb:close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        is_owner = interaction.user.id == get_requester_id(interaction.channel)
+        if not is_owner and not interaction.user.guild_permissions.manage_channels:
+            return await interaction.response.send_message(
+                "Only the requester or staff can close this.", ephemeral=True
+            )
+        await interaction.response.send_message("🔒 Closing this ticket in 5 seconds...")
+        await asyncio.sleep(5)
+        await interaction.channel.delete()
+
+
+# ------------------------- Request form -------------------------
+class RequestModal(discord.ui.Modal):
+    def __init__(self, request_type: str):
+        super().__init__(title=f"TSB {request_type} Request")
+        self.request_type = request_type
+
+        self.teamers = discord.ui.TextInput(
+            label="Teamers' names",
+            style=discord.TextStyle.paragraph,
+            placeholder="One name per line",
+            max_length=500,
+        )
+        self.clan = discord.ui.TextInput(
+            label="Clan (if any)",
+            required=False,
+            max_length=60,
+        )
+        self.server_link = discord.ui.TextInput(
+            label="Server link",
+            placeholder="https://...",
+            max_length=300,
+        )
+        self.username = discord.ui.TextInput(
+            label="Your Roblox username",
+            max_length=40,
+        )
+        for item in (self.teamers, self.clan, self.server_link, self.username):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        link = self.server_link.value.strip()
+        if not link.lower().startswith(("http://", "https://")):
+            return await interaction.response.send_message(
+                "❌ Server link must start with `https://`. Try again.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        category = guild.get_channel(TICKET_CATEGORY_ID)
+        if not isinstance(category, discord.CategoryChannel):
+            return await interaction.followup.send(
+                "❌ Ticket category isn't set up. Tell an admin to set TICKET_CATEGORY_ID.",
+                ephemeral=True,
+            )
+
+        # one open ticket per person
+        for existing in category.text_channels:
+            if get_requester_id(existing) == interaction.user.id:
+                return await interaction.followup.send(
+                    f"You already have an open request: {existing.mention}", ephemeral=True
+                )
+
+        roblox = await get_roblox_profile(interaction.client.session, self.username.value.strip())
+        profile_url = f"https://www.roblox.com/users/{roblox[0]}/profile" if roblox else None
+        shown_name = f"[{roblox[1]}]({profile_url})" if roblox else f"{self.username.value} *(not found on Roblox)*"
+
+        # permissions: hidden by default, viewable by viewer role (or everyone), requester can talk
+        viewer = guild.get_role(VIEWER_ROLE_ID) or guild.default_role
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            viewer: discord.PermissionOverwrite(
+                view_channel=True, send_messages=False, read_message_history=True
+            ),
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True
+            ),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, embed_links=True, manage_channels=True
+            ),
+        }
+
+        try:
+            channel = await guild.create_text_channel(
+                name=f"ticket-{interaction.user.name}"[:90],
+                category=category,
+                overwrites=overwrites,
+                topic=f"requester:{interaction.user.id}|type:{self.request_type}",
+            )
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "❌ I'm missing permissions (Manage Channels / Manage Roles).", ephemeral=True
+            )
+
+        emoji = "⚔️" if self.request_type == "Raid" else "🛡️"
+        embed = discord.Embed(
+            title=f"{emoji} TSB {self.request_type} Request",
+            description=f"{interaction.user.mention} is requesting **{self.request_type.lower()}**.",
+            color=EMBED_COLOR,
+        )
+        embed.add_field(name="Roblox Username", value=shown_name, inline=True)
+        embed.add_field(name="Clan", value=self.clan.value or "None", inline=True)
+        embed.add_field(name="Teamers", value=self.teamers.value, inline=False)
+        embed.add_field(name="Server Link", value=link, inline=False)
+        embed.set_footer(text="The Strongest Battlegrounds • Press Join Raid to help")
+
+        ping = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else None
+        await channel.send(
+            content=ping,
+            embed=embed,
+            view=TicketView(profile_url),
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
+        await interaction.followup.send(f"✅ Request created: {channel.mention}", ephemeral=True)
+
+
+# ------------------------- Panel -------------------------
+class PanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.select(
+        custom_id="tsb:panel",
+        placeholder="Request Raid — choose a type",
+        options=[
+            discord.SelectOption(label="Raid", value="Raid", emoji="⚔️", description="Need people to raid with you"),
+            discord.SelectOption(label="Backup", value="Backup", emoji="🛡️", description="Got teamed on, need support"),
+        ],
+    )
+    async def choose(self, interaction: discord.Interaction, select: discord.ui.Select):
+        await interaction.response.send_modal(RequestModal(select.values[0]))
+        # reset the dropdown so it doesn't stay stuck on the last choice
+        try:
+            await interaction.message.edit(view=PanelView())
+        except discord.HTTPException:
+            pass
+
+
+# ------------------------- Bot -------------------------
+class TSBBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=discord.Intents.default())
+        self.session: aiohttp.ClientSession | None = None
+
+    async def setup_hook(self):
+        self.session = aiohttp.ClientSession()
+        # persistent views so buttons keep working after restarts
+        self.add_view(PanelView())
+        self.add_view(TicketView())
+
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        else:
+            await self.tree.sync()
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+        await super().close()
+
+
+bot = TSBBot()
+
+
+@bot.tree.command(name="setup_panel", description="Post the raid request panel in this channel")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def setup_panel(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="⚔️ The Strongest Battlegrounds — Raid Support",
+        description=(
+            "Got teamed on? Want to raid a clan? Pick an option below and fill in the form.\n\n"
+            "⚔️ **Raid** — you want people to raid with you\n"
+            "🛡️ **Backup** — you need support right now\n\n"
+            "A ticket will open where helpers can **Join Raid** and check your profile."
+        ),
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(text="Request Raid • TSB")
+    await interaction.channel.send(embed=embed, view=PanelView())
+    await interaction.response.send_message("✅ Panel posted.", ephemeral=True)
+
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("Missing DISCORD_TOKEN. Put it in a .env file: DISCORD_TOKEN=your_token_here")
+    bot.run(TOKEN)
